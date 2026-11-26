@@ -1,4 +1,5 @@
 use anyhow::{Context, Error, Result};
+use regex::Regex;
 use std::{
     fs::File,
     io::{BufReader, BufWriter},
@@ -20,7 +21,7 @@ use crate::{
     register::RegisterManager,
     rope::{ObjectMode, Rope, WordKind},
     selection::Selection,
-    utils::{clamp_range, sel_mode},
+    utils::{clamp_range, is_word, sel_mode},
 };
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -1577,6 +1578,573 @@ impl Buffer {
             true
         });
     }
+
+    fn resolve_pattern(
+        registers: &mut RegisterManager,
+        pattern: Option<String>,
+        register: char,
+    ) -> Result<String, String> {
+        match pattern {
+            Some(p) => {
+                registers.set(register, p.clone());
+                Ok(p)
+            }
+            None => registers
+                .get(register)
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "no previous search pattern".to_string()),
+        }
+    }
+
+    /// For every selection independently, jump/extend to the next match of
+    /// `pattern` after it, wrapping around to the first match in the buffer
+    /// if none follows.
+    pub fn search_next(
+        &mut self,
+        registers: &mut RegisterManager,
+        pattern: Option<String>,
+        register: char,
+        extend: bool,
+    ) -> Result<(), String> {
+        self.search(registers, pattern, register, extend, true)
+    }
+
+    /// Same as `search_next`, searching backward (wrapping to the last match).
+    pub fn search_previous(
+        &mut self,
+        registers: &mut RegisterManager,
+        pattern: Option<String>,
+        register: char,
+        extend: bool,
+    ) -> Result<(), String> {
+        self.search(registers, pattern, register, extend, false)
+    }
+
+    fn search(
+        &mut self,
+        registers: &mut RegisterManager,
+        pattern: Option<String>,
+        register: char,
+        extend: bool,
+        forward: bool,
+    ) -> Result<(), String> {
+        let pat = Self::resolve_pattern(registers, pattern, register)?;
+        let re = Regex::new(&pat).map_err(|e| format!("invalid pattern: {e}"))?;
+        let text = self.rope.to_string();
+
+        let matches: Vec<(usize, usize)> = re
+            .find_iter(&text)
+            .map(|m| {
+                (
+                    self.rope.byte_to_char(m.start()),
+                    self.rope.byte_to_char(m.end()),
+                )
+            })
+            .collect();
+        if matches.is_empty() {
+            return Err("no matches".to_string());
+        }
+
+        let rope = &self.rope;
+        for sel in &mut self.selections {
+            let (cur_start, cur_end) = (sel.start(), sel.end());
+            let target = if forward {
+                matches
+                    .iter()
+                    .find(|&&(s, _)| s > cur_end)
+                    .or_else(|| matches.first())
+            } else {
+                matches
+                    .iter()
+                    .rev()
+                    .find(|&&(_, e)| e <= cur_start)
+                    .or_else(|| matches.last())
+            };
+            let &(start, end) = target.expect("checked non-empty above");
+            let head = end.saturating_sub(1).max(start);
+            if extend {
+                sel.head = head;
+            } else {
+                sel.anchor = start;
+                sel.head = head;
+            }
+            sel.pref_col = rope.char_to_col(sel.head);
+        }
+        self.merge_selections();
+        Ok(())
+    }
+
+    fn match_main(
+        &mut self,
+        registers: &mut RegisterManager,
+        register: char,
+        forward: bool,
+        add: bool,
+    ) -> Result<(), String> {
+        let pat = registers
+            .get(register)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| "no previous search pattern".to_string())?;
+        self.match_main_pattern(&pat, forward, add).map(|_| ())
+    }
+
+    /// `n`/`N`: adds the next/previous occurrence of the main selection's
+    /// text as the new main selection. On a bare cursor over a word it
+    /// selects that word first instead (Sublime's Ctrl-D).
+    pub fn add_occurrence(&mut self, forward: bool) -> Result<(), String> {
+        let Some(main) = self.selections.first().copied() else {
+            return Ok(());
+        };
+        let len = self.rope.len_chars();
+        if len == 0 {
+            return Ok(());
+        }
+        if main.is_empty() && is_word(self.rope.char(main.head.min(len - 1))) {
+            let (start, end) =
+                self.rope
+                    .word_object_at(main.head, WordKind::Word, ObjectMode::Inner);
+            // A one-char word is already selected; go on to its next occurrence.
+            if end - start > 1 {
+                self.selections[0].apply_range(start, end, false);
+                return Ok(());
+            }
+        }
+        let pat = self.occurrence_pattern(main);
+        self.match_main_pattern(&pat, forward, true).map(|_| ())
+    }
+
+    /// The regex for `sel`'s text as an occurrence: `\b` only where it sits on a word
+    /// edge, so a whole word matches whole words but a partial one still matches inside words.
+    fn occurrence_pattern(&self, sel: Selection) -> String {
+        let len = self.rope.len_chars();
+        let range = clamp_range(sel.range(), len);
+        let text = self.rope.slice(range.clone()).to_string();
+        let at_edge = |inside: Option<char>, outside: Option<char>| {
+            inside.is_some_and(is_word) && !outside.is_some_and(is_word)
+        };
+        let before = range.start.checked_sub(1).map(|i| self.rope.char(i));
+        let after = (range.end < len).then(|| self.rope.char(range.end));
+        let mut pat = regex::escape(&text);
+        if at_edge(text.chars().next(), before) {
+            pat = format!(r"\b{pat}");
+        }
+        if at_edge(text.chars().last(), after) {
+            pat = format!(r"{pat}\b");
+        }
+        pat
+    }
+
+    /// VS Code's Cmd+Shift+L: every occurrence of the main selection (from a bare
+    /// cursor, of the word under it), the main one staying main.
+    pub fn select_all_occurrences(&mut self) -> Result<(), String> {
+        let Some(mut main) = self.selections.first().copied() else {
+            return Ok(());
+        };
+        let len = self.rope.len_chars();
+        if len == 0 {
+            return Ok(());
+        }
+        if main.is_empty() && is_word(self.rope.char(main.head.min(len - 1))) {
+            let (start, end) =
+                self.rope
+                    .word_object_at(main.head, WordKind::Word, ObjectMode::Inner);
+            main.apply_range(start, end, false);
+        }
+        let re = Regex::new(&self.occurrence_pattern(main))
+            .map_err(|e| format!("invalid pattern: {e}"))?;
+        let text = self.rope.to_string();
+        let mut found: Vec<Selection> = re
+            .find_iter(&text)
+            .filter(|m| !m.is_empty())
+            .map(|m| {
+                let mut sel = Selection::default();
+                sel.apply_range(
+                    char_offset(&text, m.start()),
+                    char_offset(&text, m.end()),
+                    false,
+                );
+                sel
+            })
+            .collect();
+        if let Some(i) = found.iter().position(|s| s.start() == main.start()) {
+            found.swap(0, i);
+        }
+        if !found.is_empty() {
+            self.selections = found;
+        }
+        Ok(())
+    }
+
+    /// Ok(true) when the search wrapped around the buffer's end (or start).
+    pub fn match_main_pattern(
+        &mut self,
+        pat: &str,
+        forward: bool,
+        add: bool,
+    ) -> Result<bool, String> {
+        let re = Regex::new(pat).map_err(|e| format!("invalid pattern: {e}"))?;
+        let text = self.rope.to_string();
+
+        let matches: Vec<(usize, usize)> = re
+            .find_iter(&text)
+            .map(|m| {
+                (
+                    self.rope.byte_to_char(m.start()),
+                    self.rope.byte_to_char(m.end()),
+                )
+            })
+            .collect();
+        if matches.is_empty() {
+            return Err("no matches".to_string());
+        }
+
+        let Some(main) = self.selections.first().copied() else {
+            return Ok(false);
+        };
+        let (cur_start, cur_end) = (main.start(), main.end());
+        let ahead = if forward {
+            matches.iter().find(|&&(s, _)| s > cur_end)
+        } else {
+            matches.iter().rev().find(|&&(_, e)| e <= cur_start)
+        };
+        let wrapped = ahead.is_none();
+        let target = ahead.or(if forward {
+            matches.first()
+        } else {
+            matches.last()
+        });
+        let &(start, end) = target.expect("checked non-empty above");
+        let head = end.saturating_sub(1).max(start);
+        let new_sel = Selection {
+            anchor: start,
+            head,
+            pref_col: self.rope.char_to_col(head),
+        };
+
+        if add {
+            // New match becomes main, so the next `n` continues from it and `<a-,>` drops it.
+            self.selections.insert(0, new_sel);
+        } else {
+            self.selections[0] = new_sel;
+        }
+        self.merge_selections();
+        Ok(wrapped)
+    }
+
+    pub fn select_next_match_main(
+        &mut self,
+        registers: &mut RegisterManager,
+        register: char,
+    ) -> Result<(), String> {
+        self.match_main(registers, register, true, false)
+    }
+
+    pub fn select_previous_match_main(
+        &mut self,
+        registers: &mut RegisterManager,
+        register: char,
+    ) -> Result<(), String> {
+        self.match_main(registers, register, false, false)
+    }
+
+    pub fn add_next_match_selection(
+        &mut self,
+        registers: &mut RegisterManager,
+        register: char,
+    ) -> Result<(), String> {
+        self.match_main(registers, register, true, true)
+    }
+
+    pub fn add_previous_match_selection(
+        &mut self,
+        registers: &mut RegisterManager,
+        register: char,
+    ) -> Result<(), String> {
+        self.match_main(registers, register, false, true)
+    }
+
+    /// Sets the search register to the main selection's text, escaped so
+    /// it's matched literally. `smart_boundaries` wraps it in `\b` anchors
+    /// so e.g. selecting "foo" doesn't also match inside "foobar".
+    pub fn set_search_pattern_from_main_selection(
+        &mut self,
+        registers: &mut RegisterManager,
+        smart_boundaries: bool,
+        register: char,
+    ) {
+        let Some(sel) = self.selections.first() else {
+            return;
+        };
+        let range = clamp_range(sel.range(), self.rope.len_chars());
+        if range.is_empty() {
+            return;
+        }
+        let text = self.rope.slice(range).to_string();
+        let escaped = regex::escape(&text);
+        let pattern = if smart_boundaries {
+            format!(r"\b{escaped}\b")
+        } else {
+            escaped
+        };
+        registers.set(register, pattern);
+    }
+
+    /// Replaces every selection with one new selection per match of `regex`
+    /// found inside it (or per `capture` group, if given).
+    pub fn select_regex_matches(
+        &mut self,
+        regex: &str,
+        capture: Option<usize>,
+    ) -> Result<(), String> {
+        let re = Regex::new(regex).map_err(|e| format!("invalid pattern: {e}"))?;
+        let len_chars = self.rope.len_chars();
+        let mut new_selections = Vec::new();
+
+        for sel in &self.selections {
+            let range = clamp_range(sel.range(), len_chars);
+            if range.is_empty() {
+                continue;
+            }
+            let text = self.rope.slice(range.clone()).to_string();
+            let base = range.start;
+
+            for caps in re.captures_iter(&text) {
+                let Some(m) = (match capture {
+                    Some(idx) => caps.get(idx),
+                    None => caps.get(0),
+                }) else {
+                    continue;
+                };
+                let start = base + char_offset(&text, m.start());
+                let end = base + char_offset(&text, m.end());
+                if end > start {
+                    new_selections.push(Selection {
+                        anchor: start,
+                        head: end - 1,
+                        pref_col: 0,
+                    });
+                }
+            }
+        }
+
+        if new_selections.is_empty() {
+            return Err("no matches".to_string());
+        }
+        self.replace_selections(new_selections);
+        Ok(())
+    }
+
+    /// Replaces every selection with the gaps between matches of `regex`
+    /// inside it (or between `capture` groups, if given) - the inverse of
+    /// `select_regex_matches`.
+    pub fn split_selections_regex(
+        &mut self,
+        regex: &str,
+        capture: Option<usize>,
+    ) -> Result<(), String> {
+        let re = Regex::new(regex).map_err(|e| format!("invalid pattern: {e}"))?;
+        let len_chars = self.rope.len_chars();
+        let mut new_selections = Vec::new();
+
+        for sel in &self.selections {
+            let range = clamp_range(sel.range(), len_chars);
+            if range.is_empty() {
+                continue;
+            }
+            let text = self.rope.slice(range.clone()).to_string();
+            let base = range.start;
+
+            let delimiters: Vec<(usize, usize)> = re
+                .captures_iter(&text)
+                .filter_map(|caps| match capture {
+                    Some(idx) => caps.get(idx),
+                    None => caps.get(0),
+                })
+                .filter(|m| !m.as_str().is_empty())
+                .map(|m| (m.start(), m.end()))
+                .collect();
+
+            if delimiters.is_empty() {
+                new_selections.push(*sel);
+                continue;
+            }
+
+            let mut cursor = 0usize;
+            for &(d_start, d_end) in &delimiters {
+                if d_start > cursor {
+                    let start = base + char_offset(&text, cursor);
+                    let end = base + char_offset(&text, d_start);
+                    if end > start {
+                        new_selections.push(Selection {
+                            anchor: start,
+                            head: end - 1,
+                            pref_col: 0,
+                        });
+                    }
+                }
+                cursor = d_end;
+            }
+            if cursor < text.len() {
+                let start = base + char_offset(&text, cursor);
+                let end = base + char_offset(&text, text.len());
+                if end > start {
+                    new_selections.push(Selection {
+                        anchor: start,
+                        head: end - 1,
+                        pref_col: 0,
+                    });
+                }
+            }
+        }
+
+        if new_selections.is_empty() {
+            return Err("split produced no selections".to_string());
+        }
+        self.replace_selections(new_selections);
+        Ok(())
+    }
+
+    /// Kakoune's `<a-s>`: replaces each selection with one selection per
+    /// line it spans, clipped to the original selection's bounds.
+    pub fn split_selections_lines(&mut self) {
+        let rope = &self.rope;
+        let len_chars = rope.len_chars();
+        let mut new_selections = Vec::new();
+
+        for sel in &self.selections {
+            let range = clamp_range(sel.range(), len_chars);
+            if range.is_empty() {
+                new_selections.push(*sel);
+                continue;
+            }
+            let start_line = rope.char_to_line(range.start);
+            let end_line = rope.char_to_line(range.end - 1);
+            for line in start_line..=end_line {
+                let line_start = rope.line_to_char(line).max(range.start);
+                let line_end = if line + 1 < rope.len_lines() {
+                    rope.line_to_char(line + 1)
+                } else {
+                    len_chars
+                }
+                .min(range.end);
+                if line_end > line_start {
+                    new_selections.push(Selection {
+                        anchor: line_start,
+                        head: line_end - 1,
+                        pref_col: 0,
+                    });
+                }
+            }
+        }
+
+        self.replace_selections(new_selections);
+    }
+
+    /// Kakoune's `<a-S>`: replaces each selection with cursors on its first
+    /// and last characters (just the first, if it's already a single char).
+    pub fn select_endpoints(&mut self) {
+        let mut new_selections = Vec::new();
+        for sel in &self.selections {
+            let (start, end) = (sel.start(), sel.end());
+            new_selections.push(Selection {
+                anchor: start,
+                head: start,
+                pref_col: 0,
+            });
+            if end != start {
+                new_selections.push(Selection {
+                    anchor: end,
+                    head: end,
+                    pref_col: 0,
+                });
+            }
+        }
+        self.replace_selections(new_selections);
+    }
+
+    fn replace_selections(&mut self, mut new_selections: Vec<Selection>) {
+        new_selections.sort_by_key(|s| s.start());
+        let rope = &self.rope;
+        for s in &mut new_selections {
+            s.pref_col = rope.char_to_col(s.head);
+        }
+        self.selections = new_selections;
+        self.merge_selections();
+    }
+
+    /// Keeps only the selections whose text matches `regex`.
+    pub fn keep_matching_selections(&mut self, regex: &str) -> Result<(), String> {
+        self.filter_matching_selections(regex, true)
+    }
+
+    /// Drops the selections whose text matches `regex`.
+    pub fn clear_matching_selections(&mut self, regex: &str) -> Result<(), String> {
+        self.filter_matching_selections(regex, false)
+    }
+
+    fn filter_matching_selections(
+        &mut self,
+        regex: &str,
+        keep_if_match: bool,
+    ) -> Result<(), String> {
+        let re = Regex::new(regex).map_err(|e| format!("invalid pattern: {e}"))?;
+        let len_chars = self.rope.len_chars();
+        let rope = &self.rope;
+
+        let kept: Vec<Selection> = self
+            .selections
+            .iter()
+            .filter(|sel| {
+                let range = clamp_range(sel.range(), len_chars);
+                let text = rope.slice(range).to_string();
+                re.is_match(&text) == keep_if_match
+            })
+            .copied()
+            .collect();
+
+        if kept.is_empty() {
+            return Err("no selections left".to_string());
+        }
+        self.selections = kept;
+        Ok(())
+    }
+
+    /// Kakoune's `_`: trims whitespace off each selection's edges, dropping
+    /// any selection that turns out to be whitespace-only.
+    pub fn unselect_whitespace(&mut self) -> Result<(), String> {
+        let len_chars = self.rope.len_chars();
+        let rope = &self.rope;
+
+        let mut kept: Vec<Selection> = self
+            .selections
+            .iter()
+            .filter_map(|sel| {
+                let range = clamp_range(sel.range(), len_chars);
+                let mut start = range.start;
+                let mut end = range.end;
+                while start < end && rope.char(start).is_whitespace() {
+                    start += 1;
+                }
+                while start < end && rope.char(end - 1).is_whitespace() {
+                    end -= 1;
+                }
+                (start < end).then_some(Selection {
+                    anchor: start,
+                    head: end - 1,
+                    pref_col: 0,
+                })
+            })
+            .collect();
+
+        if kept.is_empty() {
+            return Err("no selections left".to_string());
+        }
+        for s in &mut kept {
+            s.pref_col = rope.char_to_col(s.head);
+        }
+        self.selections = kept;
+        Ok(())
+    }
 }
 
 /// The closing char `autopair` inserts right after a typed opener, or `None`
@@ -1644,6 +2212,12 @@ fn scan_join(rope: &Rope, start: usize, end: usize) -> Option<(Range<usize>, Str
         return None;
     }
     Some((start..i, result, space_offsets))
+}
+
+/// Counts chars in `text[..byte_idx]` to turn a regex match's byte offset
+/// (regex operates on `&str`) into a char offset within that same `text`.
+fn char_offset(text: &str, byte_idx: usize) -> usize {
+    text[..byte_idx].chars().count()
 }
 
 #[cfg(test)]

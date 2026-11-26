@@ -7,6 +7,4 @@ pub mod register;
 pub mod rope;
 pub mod search;
 pub mod selection;
-pub mod tree;
 pub mod utils;
-pub mod word;
