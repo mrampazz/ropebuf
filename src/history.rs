@@ -5,9 +5,9 @@ use std::{
 
 use crate::selection::Selection;
 
+// TODO: do we need byte_range?
 #[derive(Clone, Debug)]
 pub struct BufferEdit {
-    pub byte_range: Range<usize>,
     pub char_range: Range<usize>,
     pub text: String,
     pub old_text: String,
@@ -15,12 +15,9 @@ pub struct BufferEdit {
 
 impl BufferEdit {
     pub fn inverse(&self) -> Self {
-        let new_len = self.text.len();
         let char_len = self.text.chars().count();
-        let inverted_range = self.byte_range.start..(self.byte_range.start + new_len);
         let inverted_char_range = self.char_range.start..(self.char_range.start + char_len);
         BufferEdit {
-            byte_range: inverted_range,
             char_range: inverted_char_range,
             text: self.old_text.clone(),
             old_text: self.text.clone(),

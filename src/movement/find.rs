@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    buffer::{Buffer, SelectionMode},
-    rope::Rope,
-};
+use crate::buffer::{Buffer, SelectionMode};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindKind {
@@ -22,90 +19,6 @@ pub struct CharSearch {
     pub kind: FindKind,
     pub direction: FindDirection,
     pub target: char,
-}
-
-impl Rope {
-    /// returns the forward char index of the nth occurrence of the target char
-    fn find_char_forward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
-        let len = self.len_chars();
-        let mut pos = char_idx;
-        let mut remaining = count;
-        while pos < len {
-            pos = self.next_grapheme(pos);
-            if pos >= len {
-                return None;
-            }
-            if self.char(pos) == target {
-                remaining -= 1;
-                if remaining == 0 {
-                    return Some(pos);
-                }
-            }
-        }
-        None
-    }
-
-    /// returns the backward char index of the nth occurrence of the target char
-    fn find_char_backward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
-        let mut pos = char_idx;
-        let mut remaining = count;
-        while pos > 0 {
-            pos = self.prev_grapheme(pos);
-            if self.char(pos) == target {
-                remaining -= 1;
-                if remaining == 0 {
-                    return Some(pos);
-                }
-            }
-        }
-        None
-    }
-}
-
-impl Buffer {
-    pub fn find_char(&mut self, search: CharSearch, count: Option<usize>, extend: bool) {
-        self.last_char_search = Some(search);
-        self.run_char_search(search, count.unwrap_or(1), extend, false);
-    }
-
-    pub fn repeat_char_search(&mut self, extend: bool) {
-        if let Some(search) = self.last_char_search {
-            self.run_char_search(search, 1, extend, true);
-        }
-    }
-
-    fn run_char_search(&mut self, search: CharSearch, count: usize, extend: bool, is_repeat: bool) {
-        self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let from = if is_repeat && search.kind == FindKind::Until {
-                match search.direction {
-                    FindDirection::Forward => rope.next_grapheme(sel.head),
-                    FindDirection::Backward => rope.prev_grapheme(sel.head),
-                }
-            } else {
-                sel.head
-            };
-
-            let found = match search.direction {
-                FindDirection::Forward => rope.find_char_forward(from, search.target, count),
-                FindDirection::Backward => rope.find_char_backward(from, search.target, count),
-            };
-
-            if let Some(found) = found {
-                let target = match (search.kind, search.direction) {
-                    (FindKind::Until, FindDirection::Forward) => rope.prev_grapheme(found),
-                    (FindKind::Until, FindDirection::Backward) => rope.next_grapheme(found),
-                    (FindKind::To, _) => found,
-                };
-                if extend {
-                    sel.head = target;
-                } else {
-                    sel.anchor = sel.head;
-                    sel.head = target;
-                }
-            }
-            true
-        });
-    }
 }
 
 #[cfg(test)]

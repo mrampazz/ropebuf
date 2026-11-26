@@ -10,12 +10,17 @@ use std::{
 use crate::{
     history::{BufferEdit, History, Transaction},
     line_ending::{LineEnding, LineEndingWriter, LineNormaliser, detect_line_ending},
-    movement::find::CharSearch,
+    movement::{
+        buffer::BufferMovement,
+        ch::Direction,
+        find::{CharSearch, FindDirection, FindKind},
+        line::LineMovement,
+        word::WordMovement,
+    },
     register::RegisterManager,
-    rope::Rope,
+    rope::{ObjectMode, Rope, WordKind},
     selection::Selection,
-    textobject::ObjectMode,
-    utils::clamp_range,
+    utils::{clamp_range, sel_mode},
 };
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -138,7 +143,7 @@ impl Buffer {
 
         let buf_writer = BufWriter::new(file);
         let writer = LineEndingWriter::new(buf_writer, self.original_line_ending);
-        self.rope.save(writer)?;
+        self.rope.write(writer)?;
         self.dirty = false;
         self.disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok(())
@@ -1273,7 +1278,7 @@ impl Buffer {
 
     pub fn select_pair_at(&mut self, open: char, close: char, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let mut found = rope.select_pair_object(sel.head, open, close, mode);
+            let mut found = rope.pair_object_at(sel.head, open, close, mode);
             // Already selecting exactly this pair: a repeat (or count) grows to the one around it.
             if !sel.is_empty() && found == Some((sel.start(), sel.end() + 1)) {
                 let (start, _) = found.unwrap();
@@ -1284,7 +1289,7 @@ impl Buffer {
                 };
                 found = open_idx
                     .checked_sub(1)
-                    .and_then(|from| rope.select_pair_object(from, open, close, mode))
+                    .and_then(|from| rope.pair_object_at(from, open, close, mode))
                     .filter(|&outer| Some(outer) != found);
             }
             if let Some((start, end)) = found {
@@ -1297,9 +1302,7 @@ impl Buffer {
     pub fn select_tag_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
             let grow = !sel.is_empty();
-            if let Some((start, end)) =
-                rope.select_tag_object(sel.start(), sel.end() + 1, grow, mode)
-            {
+            if let Some((start, end)) = rope.tag_object_at(sel.start(), sel.end() + 1, grow, mode) {
                 sel.apply_range(start, end, extend);
             }
             true
@@ -1308,7 +1311,7 @@ impl Buffer {
 
     pub fn select_matching_pair(&mut self, forward: bool, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            if let Some((start, end)) = rope.select_matching_pair(sel.head, forward) {
+            if let Some((start, end)) = rope.matching_pair_at(sel.head, forward) {
                 sel.apply_range(start, end, extend);
             }
             true
@@ -1317,7 +1320,7 @@ impl Buffer {
 
     pub fn select_whitespace_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_whitespace_object(sel.head, mode);
+            let (start, end) = rope.whitespace_object_at(sel.head, mode);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1325,7 +1328,7 @@ impl Buffer {
 
     pub fn select_number_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_number_object(sel.head, mode);
+            let (start, end) = rope.number_object_at(sel.head, mode);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1334,7 +1337,7 @@ impl Buffer {
     pub fn select_indent_at(&mut self, mode: ObjectMode, extend: bool) {
         let indent_width = self.indent_width;
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_indent_object(sel.head, mode, indent_width);
+            let (start, end) = rope.indent_object_at(sel.head, mode, indent_width);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1342,7 +1345,7 @@ impl Buffer {
 
     pub fn select_paragraph_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_paragraph_object(sel.head, mode);
+            let (start, end) = rope.paragraph_object_at(sel.head, mode);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1350,7 +1353,7 @@ impl Buffer {
 
     pub fn select_sentence_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_sentence_object(sel.head, mode);
+            let (start, end) = rope.sentence_object_at(sel.head, mode);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1358,7 +1361,7 @@ impl Buffer {
 
     pub fn select_argument_at(&mut self, mode: ObjectMode, extend: bool) {
         self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
-            let (start, end) = rope.select_argument_object(sel.head, mode);
+            let (start, end) = rope.argument_object_at(sel.head, mode);
             sel.apply_range(start, end, extend);
             true
         });
@@ -1368,6 +1371,211 @@ impl Buffer {
         self.selections = vec![Selection::default()];
         self.selections[0].head = self.rope.buffer_range().end;
         self.selections[0].anchor = self.rope.buffer_range().start;
+    }
+
+    pub fn move_in_buffer(&mut self, movement: BufferMovement, extend: bool) {
+        self.apply_movement(sel_mode(extend), |buffer, sel| {
+            let Range { start, end } = buffer.buffer_range();
+            sel.head = match movement {
+                BufferMovement::Home => start,
+                BufferMovement::End => end,
+            };
+            true
+        });
+    }
+
+    /// goes to the first char of the last line
+    pub fn goto_last_line(&mut self, extend: bool) {
+        self.apply_movement(sel_mode(extend), |rope, sel| {
+            let last_line = rope.len_lines().saturating_sub(1);
+            sel.head = rope.line_to_char(last_line);
+            true
+        });
+    }
+
+    /// goes to the first char of the given 1-indexed line
+    pub fn goto_line(&mut self, line: usize, extend: bool) {
+        self.apply_movement(sel_mode(extend), |rope, sel| {
+            let last_line = rope.len_lines().saturating_sub(1);
+            let target = line.saturating_sub(1).min(last_line);
+            sel.head = rope.line_to_char(target);
+            true
+        });
+    }
+
+    /// Jumps to the cursor position right after the last undo-stack entry
+    /// (Kakoune's `g .`) - a no-op if nothing has been edited yet.
+    pub fn goto_last_modification_position(&mut self, extend: bool) {
+        let Some(target) = self
+            .history
+            .undo_stack
+            .last()
+            .and_then(|tx| tx.selections_after.first())
+            .map(|sel| sel.head)
+        else {
+            return;
+        };
+        self.apply_movement(sel_mode(extend), |_, sel| {
+            sel.head = target;
+            true
+        });
+    }
+
+    pub fn move_char(&mut self, dir: Direction, extend: bool) {
+        self.apply_movement(sel_mode(extend), |buffer, sel| match dir {
+            Direction::Left => {
+                sel.head = buffer.prev_grapheme(sel.head);
+                true
+            }
+            Direction::Right => {
+                sel.head = buffer.next_grapheme(sel.head);
+                true
+            }
+            Direction::Up => {
+                sel.head = buffer.above_grapheme(sel.head, sel.pref_col);
+                false
+            }
+            Direction::Down => {
+                sel.head = buffer.below_grapheme(sel.head, sel.pref_col);
+                false
+            }
+        });
+    }
+
+    pub fn find_char(&mut self, search: CharSearch, count: Option<usize>, extend: bool) {
+        self.last_char_search = Some(search);
+        self.run_char_search(search, count.unwrap_or(1), extend, false);
+    }
+
+    pub fn repeat_char_search(&mut self, extend: bool) {
+        if let Some(search) = self.last_char_search {
+            self.run_char_search(search, 1, extend, true);
+        }
+    }
+
+    fn run_char_search(&mut self, search: CharSearch, count: usize, extend: bool, is_repeat: bool) {
+        self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
+            let from = if is_repeat && search.kind == FindKind::Until {
+                match search.direction {
+                    FindDirection::Forward => rope.next_grapheme(sel.head),
+                    FindDirection::Backward => rope.prev_grapheme(sel.head),
+                }
+            } else {
+                sel.head
+            };
+
+            let found = match search.direction {
+                FindDirection::Forward => rope.find_char_forward(from, search.target, count),
+                FindDirection::Backward => rope.find_char_backward(from, search.target, count),
+            };
+
+            if let Some(found) = found {
+                let target = match (search.kind, search.direction) {
+                    (FindKind::Until, FindDirection::Forward) => rope.prev_grapheme(found),
+                    (FindKind::Until, FindDirection::Backward) => rope.next_grapheme(found),
+                    (FindKind::To, _) => found,
+                };
+                if extend {
+                    sel.head = target;
+                } else {
+                    sel.anchor = sel.head;
+                    sel.head = target;
+                }
+            }
+            true
+        });
+    }
+
+    pub fn move_in_line(&mut self, movement: LineMovement, extend: bool) {
+        self.apply_movement(sel_mode(extend), |buffer, sel| {
+            sel.head = match movement {
+                LineMovement::LineHome => buffer.line_start(sel.head),
+                LineMovement::LineEnd => buffer.line_end(sel.head),
+                LineMovement::LineHomeNoWhitespace => buffer.first_non_whitespace_of_line(sel.head),
+            };
+            true
+        });
+    }
+
+    pub fn select_line(&mut self) {
+        self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
+            let (start, end) = rope.extend_line_selection(sel.anchor, sel.head);
+            sel.anchor = start;
+            sel.head = end;
+            true
+        });
+    }
+
+    /// Shrinks each selection down to the full lines it fully contains,
+    /// dropping any partial line at either edge and the last line's
+    /// trailing end-of-line (Kakoune's `<a-x>`, the inverse of `select_line`).
+    pub fn trim_line_selection(&mut self) {
+        self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
+            let len = rope.len_chars();
+            if len == 0 {
+                return false;
+            }
+            let start = sel.start().min(len - 1);
+            let end_excl = (sel.end() + 1).min(len);
+
+            let start_line = rope.char_to_line(start);
+            let first_full_line = if start == rope.line_to_char(start_line) {
+                start_line
+            } else {
+                start_line + 1
+            };
+
+            let end_line = rope.char_to_line((end_excl - 1).min(len - 1));
+            let next_line_start = if end_line + 1 < rope.len_lines() {
+                rope.line_to_char(end_line + 1)
+            } else {
+                len
+            };
+            let last_full_line = if end_excl >= next_line_start {
+                Some(end_line)
+            } else {
+                end_line.checked_sub(1)
+            };
+            let Some(last_full_line) = last_full_line else {
+                return false;
+            };
+            if first_full_line > last_full_line || first_full_line >= rope.len_lines() {
+                return false;
+            }
+
+            let new_start = rope.line_to_char(first_full_line);
+            let new_end_excl = rope.line_end(rope.line_to_char(last_full_line));
+            sel.anchor = new_start;
+            sel.head = new_end_excl.saturating_sub(1).max(new_start);
+            true
+        });
+    }
+
+    pub fn move_word(&mut self, movement: WordMovement, kind: WordKind, extend: bool) {
+        let selector = match movement {
+            WordMovement::NextStart => Rope::next_word_start_range,
+            WordMovement::PrevStart => Rope::prev_word_start_range,
+            WordMovement::NextEnd => Rope::next_word_end_range,
+        };
+
+        self.apply_movement(SelectionMode::SetExplicit, |buffer, sel| {
+            let (anchor, head) = selector(buffer, sel.head, kind);
+            if extend {
+                sel.head = head;
+            } else {
+                sel.anchor = anchor;
+                sel.head = head;
+            }
+            true
+        });
+    }
+
+    pub fn select_word_at(&mut self, kind: WordKind, mode: ObjectMode, extend: bool) {
+        self.apply_movement(SelectionMode::SetExplicit, |rope, sel| {
+            let (start, end) = rope.word_object_at(sel.head, kind, mode);
+            sel.apply_range(start, end, extend);
+            true
+        });
     }
 }
 

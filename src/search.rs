@@ -2,10 +2,9 @@ use regex::Regex;
 
 use crate::{
     buffer::Buffer,
-    movement::word::{WordKind, is_word},
     register::RegisterManager,
+    rope::{ObjectMode, WordKind, is_word},
     selection::Selection,
-    textobject::ObjectMode,
     utils::clamp_range,
 };
 
@@ -139,7 +138,7 @@ impl Buffer {
         if main.is_empty() && is_word(self.rope.char(main.head.min(len - 1))) {
             let (start, end) =
                 self.rope
-                    .select_word_object(main.head, WordKind::Default, ObjectMode::Inner);
+                    .word_object_at(main.head, WordKind::Word, ObjectMode::Inner);
             // A one-char word is already selected; go on to its next occurrence.
             if end - start > 1 {
                 self.selections[0].apply_range(start, end, false);
@@ -184,7 +183,7 @@ impl Buffer {
         if main.is_empty() && is_word(self.rope.char(main.head.min(len - 1))) {
             let (start, end) =
                 self.rope
-                    .select_word_object(main.head, WordKind::Default, ObjectMode::Inner);
+                    .word_object_at(main.head, WordKind::Word, ObjectMode::Inner);
             main.apply_range(start, end, false);
         }
         let re = Regex::new(&self.occurrence_pattern(main))
