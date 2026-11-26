@@ -164,10 +164,11 @@ impl Rope {
                 break;
             }
         }
+
         count
     }
 
-    pub fn buffer_range(&self) -> Range<usize> {
+    pub fn range(&self) -> Range<usize> {
         0..self.len_chars().saturating_sub(1)
     }
 

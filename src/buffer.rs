@@ -1408,13 +1408,13 @@ impl Buffer {
 
     pub fn select_all(&mut self) {
         self.selections = vec![Selection::default()];
-        self.selections[0].head = self.rope.buffer_range().end;
-        self.selections[0].anchor = self.rope.buffer_range().start;
+        self.selections[0].head = self.rope.range().end;
+        self.selections[0].anchor = self.rope.range().start;
     }
 
     pub fn move_in_buffer(&mut self, movement: BufferMovement, extend: bool) {
         self.apply_movement(sel_mode(extend), |buffer, sel| {
-            let Range { start, end } = buffer.buffer_range();
+            let Range { start, end } = buffer.range();
             sel.head = match movement {
                 BufferMovement::Home => start,
                 BufferMovement::End => end,
@@ -3248,7 +3248,7 @@ mod tests {
         at(&mut buf, 3);
 
         buf.move_in_buffer(BufferMovement::End, false);
-        assert_eq!(buf.selections[0].head, buf.rope.buffer_range().end);
+        assert_eq!(buf.selections[0].head, buf.rope.range().end);
 
         buf.move_in_buffer(BufferMovement::Home, false);
         assert_eq!(buf.selections[0].head, 0);
