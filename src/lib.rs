@@ -1,7 +1,6 @@
 pub mod buffer;
 pub mod history;
 pub mod line_ending;
-pub mod movement;
 pub mod overlay;
 pub mod register;
 pub mod rope;

@@ -1,5 +1,6 @@
 use anyhow::{Context, Error, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{BufReader, BufWriter},
@@ -11,18 +12,58 @@ use std::{
 use crate::{
     history::{BufferEdit, History, Transaction},
     line_ending::{LineEnding, LineEndingWriter, LineNormaliser, detect_line_ending},
-    movement::{
-        buffer::BufferMovement,
-        ch::Direction,
-        find::{CharSearch, FindDirection, FindKind},
-        line::LineMovement,
-        word::WordMovement,
-    },
     register::RegisterManager,
     rope::{ObjectMode, Rope, WordKind},
     selection::Selection,
     utils::{clamp_range, is_word, sel_mode},
 };
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy)]
+pub enum BufferMovement {
+    Home,
+    End,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindKind {
+    To,
+    Until,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharSearch {
+    pub kind: FindKind,
+    pub direction: FindDirection,
+    pub target: char,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy)]
+pub enum LineMovement {
+    LineHome,
+    LineEnd,
+    LineHomeNoWhitespace,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy)]
+pub enum WordMovement {
+    NextStart,
+    NextEnd,
+    PrevStart,
+}
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum SelectionMode {
@@ -151,10 +192,7 @@ impl Buffer {
     }
 
     /// Whether the file backing this buffer has been modified on disk since
-    /// it was opened or last saved - checked lazily (see `disk_mtime`), not
-    /// via a filesystem watch. `false` for a path-less scratch buffer or
-    /// when the file is simply gone (a more specific "it was deleted"
-    /// warning isn't wired up here).
+    /// it was opened or last saved - checked lazily (see `disk_mtime`)
     pub fn changed_on_disk(&self) -> bool {
         let (Some(path), Some(recorded)) = (&self.path, self.disk_mtime) else {
             return false;
@@ -2222,8 +2260,6 @@ fn char_offset(text: &str, byte_idx: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::movement::ch::Direction;
-
     use super::*;
 
     #[test]
@@ -3199,10 +3235,493 @@ mod tests {
         let mut buf = Buffer::from_str("one\ntwo");
         at(&mut buf, 0);
 
-        buf.move_in_line(crate::movement::line::LineMovement::LineEnd, false);
+        buf.move_in_line(LineMovement::LineEnd, false);
         buf.enter_insert_before();
         buf.insert_char('X');
 
         assert_eq!(buf.rope.to_string(), "oneX\ntwo");
+    }
+
+    #[test]
+    fn home_and_end_move_to_buffer_boundaries() {
+        let mut buf = Buffer::from_str("hello\nworld");
+        at(&mut buf, 3);
+
+        buf.move_in_buffer(BufferMovement::End, false);
+        assert_eq!(buf.selections[0].head, buf.rope.buffer_range().end);
+
+        buf.move_in_buffer(BufferMovement::Home, false);
+        assert_eq!(buf.selections[0].head, 0);
+    }
+
+    #[test]
+    fn goto_last_line_lands_on_its_first_char_not_the_buffer_end() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 0);
+
+        buf.goto_last_line(false);
+        assert_eq!(buf.selections[0].head, 8); // 't' of "three"
+    }
+
+    #[test]
+    fn goto_line_is_one_indexed_and_clamps_past_the_end() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 0);
+
+        buf.goto_line(2, false);
+        assert_eq!(buf.selections[0].head, 4); // 't' of "two"
+
+        buf.goto_line(99, false);
+        assert_eq!(buf.selections[0].head, 8); // clamped to the last line
+    }
+
+    #[test]
+    fn goto_last_modification_position_returns_to_the_last_edit() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 5); // inside "two"
+        buf.enter_insert_before();
+        buf.insert_char('X');
+        let edit_head = buf.selections[0].head;
+
+        buf.goto_last_line(false);
+        assert_ne!(buf.selections[0].head, edit_head);
+
+        buf.goto_last_modification_position(false);
+        assert_eq!(buf.selections[0].head, edit_head);
+    }
+
+    #[test]
+    fn goto_last_modification_position_is_a_no_op_with_no_history() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 5);
+
+        buf.goto_last_modification_position(false);
+        assert_eq!(buf.selections[0].head, 5);
+    }
+
+    fn search(kind: FindKind, direction: FindDirection, target: char) -> CharSearch {
+        CharSearch {
+            kind,
+            direction,
+            target,
+        }
+    }
+
+    #[test]
+    fn f_lands_on_the_target_char() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, 't'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 5); // 't' of "the"
+    }
+
+    #[test]
+    fn t_lands_just_short_of_the_target_char() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::Until, FindDirection::Forward, 't'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 4); // the space right before "the"
+    }
+
+    #[test]
+    fn capital_f_searches_backward_landing_on_target() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 13); // the 'e' of "target", one before its trailing 't'
+        buf.find_char(
+            search(FindKind::To, FindDirection::Backward, 't'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 9); // the 't' that starts "target"
+    }
+
+    #[test]
+    fn capital_t_searches_backward_landing_just_short_of_target() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 13); // the 'e' of "target", one before its trailing 't'
+        buf.find_char(
+            search(FindKind::Until, FindDirection::Backward, 't'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 10); // right after that 't'
+    }
+
+    #[test]
+    fn count_skips_to_the_nth_occurrence() {
+        let mut buf = Buffer::from_str("a-b-c-d");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, '-'),
+            Some(3),
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 5); // the 3rd '-'
+    }
+
+    #[test]
+    fn missing_target_leaves_selection_untouched() {
+        let mut buf = Buffer::from_str("hello world");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, 'z'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 0);
+    }
+
+    #[test]
+    fn non_extending_search_selects_from_the_old_head_to_the_target() {
+        // Like `w`/`b`/`e`, a non-extending search still selects the text
+        // it swept over - it doesn't collapse to a bare cursor on the
+        // target the way plain h/j/k/l movement would.
+        let mut buf = Buffer::from_str("find the target");
+        buf.selections = vec![Selection {
+            anchor: 0,
+            head: 2,
+            pref_col: 0,
+        }];
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, 't'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].anchor, 2); // the old head
+        assert_eq!(buf.selections[0].head, 5);
+    }
+
+    #[test]
+    fn extending_search_keeps_the_anchor() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, 't'),
+            None,
+            true,
+        );
+        assert_eq!(buf.selections[0].anchor, 0);
+        assert_eq!(buf.selections[0].head, 5);
+    }
+
+    #[test]
+    fn repeat_reuses_the_last_search() {
+        let mut buf = Buffer::from_str("a-b-c-d");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::To, FindDirection::Forward, '-'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 1);
+        buf.repeat_char_search(false);
+        assert_eq!(buf.selections[0].head, 3);
+        buf.repeat_char_search(false);
+        assert_eq!(buf.selections[0].head, 5);
+    }
+
+    #[test]
+    fn repeat_with_no_prior_search_is_a_no_op() {
+        let mut buf = Buffer::from_str("find the target");
+        at(&mut buf, 0);
+        buf.repeat_char_search(false);
+        assert_eq!(buf.selections[0].head, 0);
+    }
+
+    #[test]
+    fn repeating_until_skips_past_the_char_it_already_stopped_before() {
+        // `t-` from the start stops right before the first '-'; repeating
+        // it naively would re-find that same '-' and not move at all, so
+        // the repeat has to step past it first (matching vim/kakoune).
+        let mut buf = Buffer::from_str("a-b-c-d");
+        at(&mut buf, 0);
+        buf.find_char(
+            search(FindKind::Until, FindDirection::Forward, '-'),
+            None,
+            false,
+        );
+        assert_eq!(buf.selections[0].head, 0); // already right before the 1st '-'
+        buf.repeat_char_search(false);
+        assert_eq!(buf.selections[0].head, 2); // right before the 2nd '-'
+    }
+
+    #[test]
+    fn word_range() {
+        let r = Rope::from_str("pollo");
+        assert_eq!(r.current_word(0, WordKind::Word), 0..5);
+    }
+
+    #[test]
+    fn adjacent_word() {
+        let r = Rope::from_str("ciao come stai");
+        assert_eq!(r.next_word(0, WordKind::Word), 5..9);
+        assert_eq!(r.prev_word(4, WordKind::Word), 0..4);
+        assert_eq!(r.next_word(4, WordKind::Word), 5..9);
+        assert_eq!(r.prev_word(9, WordKind::Word), 5..9);
+    }
+
+    #[test]
+    fn big_word() {
+        let r = Rope::from_str("word.exe");
+        assert_eq!(r.current_word(0, WordKind::WORD), 0..8);
+    }
+
+    #[test]
+    fn sub_word() {
+        let r = Rope::from_str("camelCase snake_case");
+        assert_eq!(r.next_word(0, WordKind::Sub), 5..9);
+        assert_eq!(r.next_word(6, WordKind::Sub), 10..15);
+    }
+
+    #[test]
+    fn w_from_whitespace_selects_the_whole_next_word() {
+        // Whitespace isn't a word: starting on the separator skips it
+        // entirely and selects the full next word, nothing before it.
+        let mut buf = Buffer::from_str("ciao come");
+        at(&mut buf, 4); // the space between the two words
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "come");
+    }
+
+    #[test]
+    fn w_from_word_start_selects_word_plus_trailing_separator() {
+        // Starting inside a word keeps the selection from the cursor's
+        // position through the trailing separator, stopping just before the
+        // next word starts (not entering it).
+        let mut buf = Buffer::from_str("hello world hi");
+        at(&mut buf, 0);
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello ");
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "world ");
+    }
+
+    #[test]
+    fn b_from_next_word_start_selects_prev_word_plus_leading_separator() {
+        // Starting right on the next word's first char jumps fully back:
+        // the gap between the two words is reclaimed as "preceding
+        // whitespace", but the char the cursor started on is not pulled in.
+        let mut buf = Buffer::from_str("hello world");
+        at(&mut buf, 6); // 'w' of "world"
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello ");
+    }
+
+    #[test]
+    fn b_mid_token_finishes_the_token_only() {
+        // Still mid-token: finish backward to this word's own start, no
+        // separator involved since no gap was crossed.
+        let mut buf = Buffer::from_str(" hello world hi");
+        at(&mut buf, 9); // 'r', middle of "world"
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "wor");
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello ");
+    }
+
+    #[test]
+    fn b_three_presses_walks_use_rpc_colon_colon_client_backward() {
+        let mut buf = Buffer::from_str("use rpc::client");
+        at(&mut buf, 14); // 't', last char of "client"
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "client");
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "::");
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "rpc");
+    }
+
+    #[test]
+    fn w_does_not_absorb_the_trailing_newline() {
+        let mut buf = Buffer::from_str("hello\nworld");
+        at(&mut buf, 0);
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello");
+    }
+
+    #[test]
+    fn e_does_not_absorb_a_newline_crossed_while_jumping() {
+        let mut buf = Buffer::from_str("hi\nworld");
+        at(&mut buf, 1); // last char of "hi"
+        buf.move_word(WordMovement::NextEnd, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "world");
+    }
+
+    #[test]
+    fn e_keeps_leading_indentation_on_the_destination_line() {
+        let mut buf = Buffer::from_str("hi\n  world");
+        at(&mut buf, 1); // last char of "hi"
+        buf.move_word(WordMovement::NextEnd, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "  world");
+    }
+
+    #[test]
+    fn b_does_not_absorb_a_newline_crossed_while_jumping() {
+        let mut buf = Buffer::from_str("hello\nworld");
+        at(&mut buf, 6); // 'w' of "world"
+        buf.move_word(WordMovement::PrevStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello");
+    }
+
+    #[test]
+    fn e_from_word_start_finishes_current_word_only() {
+        // Mid/at the start of a word: `e` just lands on this word's own end,
+        // no separator is touched since nothing was jumped over.
+        let mut buf = Buffer::from_str("hello world");
+        at(&mut buf, 0);
+        buf.move_word(WordMovement::NextEnd, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "hello");
+    }
+
+    #[test]
+    fn e_from_word_end_jumps_to_next_word_end_with_leading_separator() {
+        // Already at the current word's last char: jump the gap (captured
+        // as "preceding whitespace") and land on the next word's last char.
+        let mut buf = Buffer::from_str("hello world hi");
+        at(&mut buf, 4); // last 'o' of "hello"
+        buf.move_word(WordMovement::NextEnd, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), " world");
+    }
+
+    #[test]
+    fn e_from_whitespace_selects_through_next_words_end() {
+        let mut buf = Buffer::from_str("ciao come");
+        at(&mut buf, 4); // the space between the two words
+        buf.move_word(WordMovement::NextEnd, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "come");
+    }
+
+    #[test]
+    fn w_from_last_char_of_token_adjacent_to_punctuation_enters_next_cleanly() {
+        // "rpc" is directly followed by "::" with no whitespace in between.
+        // At the LAST char of "rpc" there's nothing left of it to extend
+        // through, so `w` jumps fully into "::" (anchor included) rather
+        // than dragging the already-finished 'c' along as "c::".
+        let mut buf = Buffer::from_str("rpc::client");
+        at(&mut buf, 2); // last 'c' of "rpc"
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "::");
+    }
+
+    #[test]
+    fn w_mid_token_adjacent_to_punctuation_finishes_the_token_only() {
+        // Still mid-token (not yet at its last char): finish "rpc" itself,
+        // but don't cross into "::" in the same press.
+        let mut buf = Buffer::from_str("rpc::client");
+        at(&mut buf, 1); // 'p', middle of "rpc"
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "pc");
+    }
+
+    #[test]
+    fn w_four_presses_walks_use_rpc_colon_colon_client() {
+        let mut buf = Buffer::from_str("use rpc::client");
+        at(&mut buf, 0);
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "use ");
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "rpc");
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "::");
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false);
+        assert_eq!(buf.get_selected_text(), "client");
+    }
+
+    #[test]
+    fn shift_w_extends_head_without_moving_anchor() {
+        let mut buf = Buffer::from_str("hello world next");
+        at(&mut buf, 0);
+        buf.move_word(WordMovement::NextStart, WordKind::Word, false); // "hello "
+        buf.move_word(WordMovement::NextStart, WordKind::Word, true); // extend
+        assert_eq!(buf.get_selected_text(), "hello world "); // anchor stayed at 0
+    }
+
+    #[test]
+    fn object_selection_selects_the_whole_word() {
+        // Regression test: `apply_range` stores `head` as the last included
+        // character, which silently under-selected by one char before
+        // `Selection::range()` became an inclusive, closed interval.
+        let mut buf = Buffer::from_str("hello world");
+        at(&mut buf, 0);
+        buf.select_word_at(WordKind::Word, ObjectMode::Inner, false);
+        assert_eq!(buf.get_selected_text(), "hello");
+    }
+
+    #[test]
+    fn first_non_whitespace_of_line_spaces() {
+        let r = Rope::from_str("    lmfao");
+        assert_eq!(r.first_non_whitespace_of_line(0), 4);
+    }
+
+    #[test]
+    fn first_non_whitespace_of_line_empty() {
+        let r = Rope::from_str("       ");
+        assert_eq!(r.first_non_whitespace_of_line(0), 0);
+    }
+
+    #[test]
+    fn line_end_then_line_home_moves_to_line_boundaries() {
+        let mut buf = Buffer::from_str("hello world\nnext line");
+        at(&mut buf, 3); // middle of "hello", on the first line
+        buf.move_in_line(LineMovement::LineEnd, false);
+        assert_eq!(buf.selections[0].head, 11); // end of "hello world"
+
+        buf.move_in_line(LineMovement::LineHome, false);
+        assert_eq!(buf.selections[0].head, 0);
+    }
+
+    #[test]
+    fn line_home_no_whitespace_skips_leading_indent() {
+        let mut buf = Buffer::from_str("    indented");
+        at(&mut buf, 10);
+        buf.move_in_line(LineMovement::LineHomeNoWhitespace, false);
+        assert_eq!(buf.selections[0].head, 4);
+    }
+
+    #[test]
+    fn select_line_first_press_selects_enclosing_line() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 5); // 'w' of "two"
+        buf.select_line();
+        assert_eq!(buf.get_selected_text(), "two\n");
+    }
+
+    #[test]
+    fn select_line_consecutive_presses_select_lines_below() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        at(&mut buf, 5); // 'w' of "two"
+        buf.select_line(); // "two\n"
+        buf.select_line(); // extends down to "three"
+        assert_eq!(buf.get_selected_text(), "two\nthree");
+    }
+
+    #[test]
+    fn select_line_expands_partial_multi_line_selection() {
+        let mut buf = Buffer::from_str("one\ntwo\nthree");
+        buf.selections = vec![Selection {
+            anchor: 1, // inside "one"
+            head: 5,   // inside "two"
+            pref_col: 0,
+        }];
+        buf.select_line();
+        assert_eq!(buf.get_selected_text(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn select_line_on_last_line_has_no_trailing_newline_and_stops_extending() {
+        let mut buf = Buffer::from_str("one\ntwo");
+        at(&mut buf, 5); // 'w' of "two"
+        buf.select_line();
+        assert_eq!(buf.get_selected_text(), "two");
+        buf.select_line(); // nothing below to extend to
+        assert_eq!(buf.get_selected_text(), "two");
     }
 }
