@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self};
 
 pub type Result<T> = std::result::Result<T, RopeError>;
 
