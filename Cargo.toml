@@ -5,8 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.105"
-arboard = "3.7.0"
-regex = "1.13.2"
 ropey = "1.6.1"
 unicode-segmentation = "1.13.3"
-serde = { version = "1.0.229", features = ["derive"] }
