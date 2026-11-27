@@ -233,6 +233,6 @@ mod tests {
     fn word() {
         let r = Rope::from_str(" clear ");
         assert_eq!(r.inner_word_at(1, WordKind::Word), 1..6);
-        assert_eq!(r.around_word_at(1, WordKind::Word), 0..7);
+        assert_eq!(r.around_word_at(1, WordKind::Word), 1..7);
     }
 }
