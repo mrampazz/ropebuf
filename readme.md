@@ -7,3 +7,4 @@ Tiny extension of `ropey::Rope`
 - textobjects aware (word, WORD, subwords, paragraph, sentences)
 
 ## What's missing
+- find functions for regex and patterns

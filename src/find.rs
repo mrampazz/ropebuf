@@ -2,7 +2,7 @@ use crate::Rope;
 
 impl Rope {
     /// returns the forward char index of the nth occurrence of the target char
-    fn find_char_forward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
+    pub fn find_char_forward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
         }
@@ -25,7 +25,7 @@ impl Rope {
     }
 
     /// returns the backward char index of the nth occurrence of the target char
-    fn find_char_backward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
+    pub fn find_char_backward(&self, char_idx: usize, target: char, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
         }
