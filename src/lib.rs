@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use ropey::Rope as Ropey;
 
 use std::{
@@ -7,9 +6,10 @@ use std::{
     sync::atomic::AtomicU64,
 };
 
-use crate::edit::ByteEdit;
+use crate::{edit::ByteEdit, error::RopeError};
 
 pub mod edit;
+pub mod error;
 pub mod find;
 pub mod grapheme;
 pub mod line;
@@ -24,6 +24,8 @@ pub enum ObjectMode {
 }
 
 static NEXT_ROPE_ID: AtomicU64 = AtomicU64::new(0);
+
+pub type RopeResult<T> = std::result::Result<T, RopeError>;
 
 pub struct Rope {
     rope: Ropey,
@@ -62,7 +64,7 @@ impl Rope {
     }
 
     /// Returns a rope object given a Reader
-    pub fn from_reader<R>(reader: R) -> Result<Self>
+    pub fn from_reader<R>(reader: R) -> RopeResult<Self>
     where
         R: Read,
     {
@@ -70,16 +72,22 @@ impl Rope {
     }
 
     /// Writes the content of the rope using a writer
-    pub fn write<W>(&self, mut writer: W) -> Result<()>
+    pub fn write<W>(&self, mut writer: W) -> RopeResult<()>
     where
         W: Write,
     {
         for chunk in self.chunks() {
             writer
                 .write_all(chunk.as_bytes())
-                .context("Failed to write buffer content to disk")?;
+                .map_err(|source| RopeError::WriteFailed {
+                    operation: "write",
+                    source,
+                })?;
         }
-        writer.flush().context("Failed to flush file writer")?;
+        writer.flush().map_err(|source| RopeError::WriteFailed {
+            operation: "flush",
+            source,
+        })?;
         Ok(())
     }
 

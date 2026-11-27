@@ -2,11 +2,14 @@
 name = "ropebuf"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85.0"
 license = "MIT OR Apache-2.0"
 description = "Tiny ropey extension grapheme aware and text objects aware"
 repository = "https://github.com/mrampazz/ropebuf"
+readme = "readme.md"
+keywords = ["rope", "grapheme", "text-objects", "editor", "unicode"]
+categories = ["text-processing", "text-editors"]
 
 [dependencies]
-anyhow = "1.0.105"
 ropey = "1.6.1"
 unicode-segmentation = "1.13.3"

@@ -9,4 +9,4 @@ Tiny extension of `ropey::Rope` specifically used for a modal editor project I'v
 ## What's missing
 - find functions for regex and patterns
 - actual testing
-- proper error handling
+- proper error handling without anyhow for public
